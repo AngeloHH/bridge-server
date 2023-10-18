@@ -1,91 +1,125 @@
+import queue
 import select
 import socket
-from _thread import start_new_thread
+from threading import Thread
 
 
-def start_socket(host, port):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen()
-    return server
+class TCPTunnel:
+    def __init__(self, hostname: tuple or int):
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.hostname = ('127.0.0.1', hostname)
+        self.tunnel_client = None
+        self.connections = {}
+        self.jumpers = queue.Queue()
+        self.recv_length = 1024
+        self.hostname = self.hostname if type(hostname) == int else hostname
 
+    def _solve_addr(self, connection: tuple or bytes):
+        # If connection is a tuple, convert to address format
+        if type(connection) == tuple:
+            port = connection[1].to_bytes(2, byteorder='big')
+            addr = bytes(map(int, connection[0].split('.')))
+            return addr + port
+        kwargs = dict(byteorder='big')
+        port = int.from_bytes(connection[4:6], **kwargs)
+        return '.'.join(map(str, connection[0:4])), port
 
-def connect_to(host, port):
-    client = socket.socket()
-    client.connect((host, port))
-    return client
+    def _close_sockets(self, *args: socket.socket):
+        # Helper method to gracefully close multiple
+        # sockets.
+        for old_socket in args:
+            old_socket.shutdown(socket.SHUT_RDWR)
+            old_socket.close()
 
-
-class Bridge:
-    def __init__(self):
-        # Set default buffer size and status for server.
-        self.ctrl_status = True
-        self.buffer_size = 4096
-
-    # Select which side is sending information and send it to the other.
-    def recv_data(self, sender, receptor):
+    def transfer(self, client: socket.socket, tunnel: socket.socket):
         while True:
-            read, write, error = select.select([sender, receptor], [], [])
-            data = read[0].recv(self.buffer_size)
-            print(data)
-            # Check if the connection is still standing.
-            if len(data) == 0:
-                break
-            # Send the information to the other side.
-            receptor.sendall(data) if read[0] == sender else sender.sendall(data)
-        print("Socket disconnected")
+            # Use select to monitor sockets for data.
+            read, write, error = select.select([client, tunnel], [], [])
+            for selected in read:
+                # Determine which socket is selected to send the data to the other.
+                receptor = client if selected == tunnel else tunnel
+                # Read data and check if the connection is closed.
+                is_closed = receptor.send(selected.recv(self.recv_length)) == 0
+                if is_closed: return self._close_sockets(client, tunnel)
 
-    # Check if controller disconnected.
-    def check_status(self, server):
-        print("Checking controller status...")
-        while self.ctrl_status:
-            self.ctrl_status = False if len(server.recv(4096)) else None
-        print("Controller closed!")
-
-    # This is the function of the bridge. All users must connect to it to be redirected.
-    # This server will have two types of user. The first will be those who will make use
-    # of the service. The information of the first group will be processed by a controller
-    # and sent to one of the other group. Each connection will have a receiver.
-    def start_server(self, host, bridge):
-        # Create the main server and the bridge controller.
-        main_server = start_socket(host[0], host[1])
-        bridge_server = start_socket(bridge[0], bridge[1])
-        print("Waiting for controller connection on port {}".format(bridge[1]))
-        controller, addr = bridge_server.accept()
-        print("Controller starter on {}:{}".format(addr[0], addr[1]))
-
-        # Start the inspection process.
-        server = main_server.getsockname()
-        print("Starting server at {}:{}".format(server[0], server[1]))
-        start_new_thread(self.check_status, (controller,))
-
+    def assign(self):
+        packet, kwargs = b'', dict(byteorder='big')
         while True:
-            # Accept new connections and check controller status.
-            client, addr = main_server.accept()
-            print("New connection from {}:{}".format(addr[0], addr[1]))
-            if not self.ctrl_status:
-                break
-            # Calls a new connection and starts a transmission thread.
-            controller.sendall(b"new-thread")
-            receptor, addr = bridge_server.accept()
-            print("New pipe from {}:{}".format(addr[0], addr[1]))
-            start_new_thread(self.recv_data, (client, receptor,))
-        print("Server closed")
+            packet += self.tunnel_client.recv(self.recv_length)
+            for data in range(0, len(packet), 12):
+                # Extract the tunnel and client addresses from the
+                # packet.
+                data = packet[data:data + 12]
+                tunnel = self._solve_addr(data[:6])
+                client = self._solve_addr(data[6:])
+                # Remove the processed packet from the data.
+                packet = packet[12:]
+                # Add the client and tunnel addresses to the queue
+                self.jumpers.put((client, tunnel))
 
-    # This is the bridge client function. their job is to process the connection
-    # of the bridge to the other site that is selected.
-    def start_client(self, forward, host):
-        # Start controller to create new connections
-        controller = connect_to(host[0], host[1])
+    def connect(self):
         while True:
-            # Receive the data and check the status of the server.
-            data = controller.recv(self.buffer_size)
-            print(data)
-            if len(data) == 0:
-                break
-            # Establishes a new connection between the bridge and the service
-            bridge = connect_to(host[0], host[1])
-            server = connect_to(forward[0], forward[1])
-            start_new_thread(self.recv_data, (bridge, server))
-        print("Connection closed")
+            # Get connections from the queue.
+            connections = self.jumpers.get()
+            client, tunnel = connections
+            no_client = client not in self.connections
+            no_tunnel = tunnel not in self.connections
+            if no_client or no_tunnel:
+                self.jumpers.put((client, tunnel))
+                continue
+            # Get the client and tunnel sockets from the connections' dictionary.
+            client = self.connections[client]
+            tunnel = self.connections[tunnel]
+            # Start a thread to transfer data between client and tunnel.
+            Thread(target=self.transfer, args=(client, tunnel), daemon=True).start()
+
+    def tunnel(self, port: int):
+        # Establish a tunnel for forwarding data.
+        packet, kwargs = b'', dict(byteorder='big')
+        self.server_socket.connect(self.hostname)
+        args = socket.AF_INET, socket.SOCK_STREAM
+        while True:
+            recv = self.server_socket.recv(self.recv_length)
+            if len(recv) == 0: break
+            packet += recv
+            for data in range(0, len(packet), 6):
+                # Extract a 6-byte packet, representing an IP address and
+                # port, from the received packet.
+                data = packet[data:data + 6]
+                # Remove the processed data from the packet and solve the
+                # address from the selected data.
+                packet = packet[6:]
+                addr = self._solve_addr(data)
+                # Check if the address is a tunnel connection
+                if addr in self.connections:
+                    continue
+                # Create client and server sockets for forwarding.
+                server = socket.socket(*args)
+                client = socket.socket(*args)
+                client.connect(self.hostname)
+                # Add the client socket to the connections' dictionary.
+                self.connections[client.getsockname()] = client
+                server.connect(('127.0.0.1', port))
+                addr = self._solve_addr(client.getsockname())
+                # Send the client address and tunnel address to the server and start a
+                # thread for transferring data between client and server.
+                self.server_socket.send(addr + data)
+                Thread(target=self.transfer, args=(client, server), daemon=True).start()
+
+    def server(self):
+        # Start the server to accept client connections.
+        self.server_socket.bind(self.hostname)
+        self.server_socket.listen()
+        # Accept the initial tunnel client connection.
+        self.tunnel_client = self.server_socket.accept()[0]
+        # Start threads to handle assignment and connections.
+        Thread(target=self.assign, daemon=True).start()
+        Thread(target=self.connect, daemon=True).start()
+        while True:
+            # Accept client connections and start transfer threads.
+            client, addr = self.server_socket.accept()
+            self.connections[addr] = client
+            # Notify the tunnel of the newly connected client by
+            # sending its address.
+            addr = self._solve_addr(addr)
+            self.tunnel_client.send(addr)

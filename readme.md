@@ -1,7 +1,5 @@
 ## What is this?
->This is a personal project, my idea was to learn about sokets, multithreading and selectors in Python.
-The main problem arose in my work center, the P2P connection was disabled.
-This project allows other user to access servers that the don't have access to via bridge.
+This project is a Python-based TCP tunneling system designed to address the challenges of P2P connections in environments where direct connections are disabled. It was created with the purpose of learning about sockets, multithreading, and selectors in Python while providing a practical solution for bridging connections between clients and servers.
 
 ### How does it work?
 <p style="text-align: center">
@@ -10,18 +8,22 @@ This project allows other user to access servers that the don't have access to v
 
 #### How to start the bridge server
 ```python
-from bridge import Bridge
-server_host = ("localhost", 5000)
-ctrl_host = ("localhost", 5001)
-Bridge().start_server(server_host, ctrl_host)
+from bridge import TCPTunnel
+# Define the server's hostname and port
+hostname = ("localhost", 5000)
+# Initialize and start the server
+TCPTunnel(hostname).server()
 ```
 
-### How to start the bridge client
+#### How to start the bridge client
 ```python
-from bridge import Bridge
-ctrl_host = ("localhost", 5001)
-destination = ("example.site.com", 80)
-Bridge().start_client(destination, ctrl_host)
+from bridge import TCPTunnel
+# Define the server's hostname and port
+hostname = ("localhost", 5000)
+# Define the local port to be tunneled
+local_port = 80
+# Initialize and start the client tunnel
+TCPTunnel(hostname).tunnel(local_port)
 ```
 
 Created with <3 by AngeloHH
