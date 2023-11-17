@@ -22,8 +22,11 @@ from bridge import TCPTunnel
 hostname = ("localhost", 5000)
 # Define the local port to be tunneled
 local_port = 80
+# The token must match the one assigned 
+# by the bridge server.
+token = 'secret-token123*'
 # Initialize and start the client tunnel
-TCPTunnel(hostname).tunnel(local_port)
+TCPTunnel(hostname).tunnel(token, local_port)
 ```
 
 Created with <3 by AngeloHH

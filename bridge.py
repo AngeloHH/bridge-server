@@ -1,4 +1,5 @@
 import queue
+import secrets
 import select
 import socket
 from threading import Thread
@@ -9,6 +10,7 @@ class TCPTunnel:
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.hostname = ('127.0.0.1', hostname)
         self.tunnel_client = None
+        self.secret_key = secrets.token_hex(20)
         self.connections = {}
         self.jumpers = queue.Queue()
         self.recv_length = 1024
@@ -23,6 +25,16 @@ class TCPTunnel:
         kwargs = dict(byteorder='big')
         port = int.from_bytes(connection[4:6], **kwargs)
         return '.'.join(map(str, connection[0:4])), port
+
+    def _check_token(self, token: str or bytes = None) -> bool:
+        # If no token is provided, send the current key to the server.
+        if token is None:
+            self.server_socket.send(self.secret_key.encode())
+            # Receive the token verification from the server.
+            token = self.server_socket.recv(self.recv_length)
+        token = token.encode() if type(token) != bytes else token
+        # Check if the token is the same as the secret key.
+        return token == self.secret_key.encode()
 
     def _close_sockets(self, *args: socket.socket):
         # Helper method to gracefully close multiple
@@ -45,7 +57,9 @@ class TCPTunnel:
     def assign(self):
         packet, kwargs = b'', dict(byteorder='big')
         while True:
-            packet += self.tunnel_client.recv(self.recv_length)
+            new_packet = self.tunnel_client.recv(self.recv_length)
+            packet += new_packet
+            if len(new_packet) == 0: break
             for data in range(0, len(packet), 12):
                 # Extract the tunnel and client addresses from the
                 # packet.
@@ -56,6 +70,7 @@ class TCPTunnel:
                 packet = packet[12:]
                 # Add the client and tunnel addresses to the queue
                 self.jumpers.put((client, tunnel))
+        self.tunnel_client = None
 
     def connect(self):
         while True:
@@ -73,11 +88,14 @@ class TCPTunnel:
             # Start a thread to transfer data between client and tunnel.
             Thread(target=self.transfer, args=(client, tunnel), daemon=True).start()
 
-    def tunnel(self, port: int):
+    def tunnel(self, token: str or bytes, port: int):
         # Establish a tunnel for forwarding data.
         packet, kwargs = b'', dict(byteorder='big')
         self.server_socket.connect(self.hostname)
         args = socket.AF_INET, socket.SOCK_STREAM
+        self.secret_key = token if type(token) != bytes else token.decode()
+        if not self._check_token():
+            raise Exception('The selected token is invalid')
         while True:
             recv = self.server_socket.recv(self.recv_length)
             if len(recv) == 0: break
@@ -110,16 +128,19 @@ class TCPTunnel:
         # Start the server to accept client connections.
         self.server_socket.bind(self.hostname)
         self.server_socket.listen()
-        # Accept the initial tunnel client connection.
-        self.tunnel_client = self.server_socket.accept()[0]
-        # Start threads to handle assignment and connections.
-        Thread(target=self.assign, daemon=True).start()
         Thread(target=self.connect, daemon=True).start()
         while True:
             # Accept client connections and start transfer threads.
             client, addr = self.server_socket.accept()
-            self.connections[addr] = client
-            # Notify the tunnel of the newly connected client by
-            # sending its address.
-            addr = self._solve_addr(addr)
-            self.tunnel_client.send(addr)
+            if self.tunnel_client is not None:
+                self.connections[addr] = client
+                # Notify the tunnel of the newly connected client by
+                # sending its address.
+                addr = self._solve_addr(addr)
+                self.tunnel_client.send(addr)
+                continue
+            if self._check_token(client.recv(self.recv_length)):
+                self.tunnel_client = client
+                self.tunnel_client.send(self.secret_key.encode())
+                Thread(target=self.assign, daemon=True).start()
+            else: client.close()
